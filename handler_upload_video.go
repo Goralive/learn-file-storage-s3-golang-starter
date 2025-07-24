@@ -1,14 +1,20 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
+	"path/filepath"
 	"strings"
 
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -69,6 +75,15 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	tempFilePath, err := filepath.Abs(tempFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "can't get path", err)
+	}
+	aspectRation, err := getVideoAspectRatio(tempFilePath)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "can't get video aspectRation", err)
+		return
+	}
 	_, err = tempFile.Seek(0, io.SeekStart)
 
 	var random [32]byte
@@ -79,7 +94,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 	fileExtension := strings.Split(mediaType, "/")
 	randomFileName := base64.RawURLEncoding.EncodeToString(random[:])
-	fileName := fmt.Sprintf("%s.%s", randomFileName, fileExtension[1])
+	fileName := fmt.Sprintf("%s/%s.%s", aspectRation, randomFileName, fileExtension[1])
 
 	_, s3Error := cfg.s3Client.PutObject(context.TODO(), &s3.PutObjectInput{
 		Bucket:      &cfg.s3Bucket,
@@ -98,4 +113,50 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		respondWithError(w, http.StatusInternalServerError, "Can't update videoUrl", err)
 		return
 	}
+}
+
+func getVideoAspectRatio(filePath string) (string, error) {
+	type FFProbeOutput struct {
+		Streams []struct {
+			Width  int `json:"width"`
+			Height int `json:"height"`
+		}
+	}
+
+	command := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filePath)
+	var buffer bytes.Buffer
+	command.Stdout = &buffer
+	err := command.Run()
+	if err != nil {
+		return "", errors.New("can't run ffprobe ")
+	}
+	var result FFProbeOutput
+
+	umarshalError := json.Unmarshal(buffer.Bytes(), &result)
+	if umarshalError != nil {
+		return "Can't parse the result", umarshalError
+	}
+	info := result.Streams[0]
+
+	ratio := float64(info.Width) / float64(info.Height)
+
+	if math.Abs(ratio-16.0/9.0) < 0.1 {
+		return "landscape", nil
+	}
+
+	if math.Abs(ratio-9.0/16.0) < 0.1 {
+		return "portrait", nil
+	}
+
+	return "other", nil
+}
+
+func processVideoForFastStart(filepath string) (string, error) {
+	outputFilePath := fmt.Sprintf("/.processing/%s", filepath)
+	command := exec.Command("ffprobe", "-i", "-c", "copy", "-movflags", "faststart", "-f", "mp4", outputFilePath)
+	err := command.Run()
+	if err != nil {
+		return "can't process fast start video", err
+	}
+	return outputFilePath, nil
 }
